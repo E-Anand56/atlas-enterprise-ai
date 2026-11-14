@@ -574,4 +574,4 @@ def guardrail_metrics(p: Principal = Depends(principal)):
         'mode': 'deterministic_demo',
         'managed_bedrock_guardrails': False
     }
-python -m uvicorn app.main:app --reload --log-level info
+python -m compileall -q app worker scripts
