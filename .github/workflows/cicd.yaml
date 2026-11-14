@@ -7,7 +7,6 @@ on:
       - main
     paths-ignore:
       - README.md
-
   workflow_dispatch:
 
 permissions:
@@ -19,10 +18,7 @@ concurrency:
 
 jobs:
 
-  # ==========================================
   # 1. CONTINUOUS INTEGRATION
-  # ==========================================
-
   integration:
     name: Continuous Integration
     runs-on: ubuntu-latest
@@ -40,11 +36,7 @@ jobs:
         run: |
           python -m compileall -q app worker scripts
 
-
-  # ==========================================
   # 2. CONTINUOUS DELIVERY
-  # ==========================================
-
   build-and-push-ecr-image:
     name: Continuous Delivery
     needs: integration
@@ -55,25 +47,15 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # Check GitHub environment secrets
       - name: Check AWS Secrets
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          if [ -n "$AWS_ACCESS_KEY_ID" ]; then
-            echo "AWS_ACCESS_KEY_ID is present"
-          else
-            echo "AWS_ACCESS_KEY_ID is EMPTY"
-          fi
+          test -n "$AWS_ACCESS_KEY_ID" || (echo "AWS_ACCESS_KEY_ID is missing" && exit 1)
+          test -n "$AWS_SECRET_ACCESS_KEY" || (echo "AWS_SECRET_ACCESS_KEY is missing" && exit 1)
+          echo "AWS credentials are present."
 
-          if [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
-            echo "AWS_SECRET_ACCESS_KEY is present"
-          else
-            echo "AWS_SECRET_ACCESS_KEY is EMPTY"
-          fi
-
-      # Configure AWS
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -81,12 +63,10 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      # Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build and push Docker image
       - name: Build and Push Docker Image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -100,35 +80,25 @@ jobs:
 
           IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          echo "Building Docker image..."
           docker build -f worker/Dockerfile -t "$IMAGE" .
-
-          echo "Pushing Docker image..."
           docker push "$IMAGE"
 
-          echo "Docker image pushed successfully"
+          echo "Docker image pushed successfully."
 
-
-  # ==========================================
   # 3. CONTINUOUS DEPLOYMENT
-  # ==========================================
-
   continuous-deployment:
     name: Continuous Deployment
     needs: build-and-push-ecr-image
     runs-on: [self-hosted, linux, x64, atlas-ec2]
     environment: production
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+      # EC2 instance profile provides AWS credentials.
+      # No AWS access keys are passed into the container.
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -142,23 +112,94 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
+          test -n "$ECR_REGISTRY"
+          test -n "$ECR_REPOSITORY"
           echo "uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Pull Docker Image
         env:
           IMAGE_URI: ${{ steps.image.outputs.uri }}
         run: |
+          set -euo pipefail
           docker pull "$IMAGE_URI"
 
       - name: Validate Application Secrets
         env:
-          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
         run: |
-          echo "Docker image is ready for deployment."
-          echo "Configure your application runtime secrets before starting the container."
+          set -euo pipefail
 
-      - name: Deployment Preparation
+          test -n "$DATABASE_URL" || (echo "DATABASE_URL is missing" && exit 1)
+          test -n "$PINECONE_API_KEY" || (echo "PINECONE_API_KEY is missing" && exit 1)
+          test -n "$PINECONE_INDEX_NAME" || (echo "PINECONE_INDEX_NAME is missing" && exit 1)
+          test -n "$S3_BUCKET" || (echo "S3_BUCKET is missing" && exit 1)
+
+          echo "Required application secrets are present."
+
+      - name: Deploy Application
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
+          PINECONE_CLOUD: ${{ secrets.PINECONE_CLOUD }}
+          PINECONE_REGION: ${{ secrets.PINECONE_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          RIUS_API_KEY: ${{ secrets.RIUS_API_KEY }}
         run: |
-          echo "EC2 deployment runner is ready."
-          echo "Image pulled successfully."
-          echo "Application container startup requires the project's runtime environment configuration."
+          set -euo pipefail
+
+          echo "Stopping previous application container..."
+          docker rm -f atlas-app 2>/dev/null || true
+
+          echo "Starting new application container..."
+
+          docker run -d \
+            --name atlas-app \
+            --restart unless-stopped \
+            -p 8000:8000 \
+            -e AWS_REGION=us-east-1 \
+            -e DATABASE_URL \
+            -e S3_BUCKET \
+            -e PINECONE_API_KEY \
+            -e PINECONE_INDEX_NAME \
+            -e PINECONE_CLOUD \
+            -e PINECONE_REGION \
+            -e BEDROCK_EMBED_MODEL=amazon.titan-embed-text-v2:0 \
+            -e BEDROCK_CHAT_MODEL=amazon.nova-lite-v1:0 \
+            -e EMBED_DIM=1024 \
+            -e RIUS_API_KEY \
+            -e RIUS_SERVICE_NAME=atlas-ai-enterprise \
+            -e RIUS_DISABLED=false \
+            "$IMAGE_URI"
+
+          echo "Application container started."
+
+      - name: Application Health Check
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for application to become healthy..."
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health/live; then
+              echo ""
+              echo "Application is alive!"
+              exit 0
+            fi
+
+            echo "Attempt $attempt/30 - waiting..."
+            sleep 2
+          done
+
+          echo "Application health check failed."
+          docker logs --tail 100 atlas-app
+          exit 1
+
+      - name: Deployment Complete
+        run: |
+          echo "Atlas Enterprise AI deployment completed."
+          docker ps --filter name=atlas-app
